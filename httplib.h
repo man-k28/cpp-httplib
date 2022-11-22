@@ -560,9 +560,8 @@ public:
     {
       std::unique_lock<std::mutex> lock(mutex_);
       shutdown_ = true;
+      cond_.notify_all();
     }
-
-    cond_.notify_all();
 
     // Join...
     for (auto &t : threads_) {
@@ -903,6 +902,7 @@ public:
   Result Head(const std::string &path, const Headers &headers);
 
   Result Post(const std::string &path);
+  Result Post(const std::string &path, const Headers &headers);
   Result Post(const std::string &path, const char *body, size_t content_length,
               const std::string &content_type);
   Result Post(const std::string &path, const Headers &headers, const char *body,
@@ -1264,6 +1264,7 @@ public:
   Result Head(const std::string &path, const Headers &headers);
 
   Result Post(const std::string &path);
+  Result Post(const std::string &path, const Headers &headers);
   Result Post(const std::string &path, const char *body, size_t content_length,
               const std::string &content_type);
   Result Post(const std::string &path, const Headers &headers, const char *body,
@@ -2602,6 +2603,9 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
       hints.ai_addrlen = static_cast<socklen_t>(
           sizeof(addr) - sizeof(addr.sun_path) + addrlen);
 
+      fcntl(sock, F_SETFD, FD_CLOEXEC);
+      if (socket_options) { socket_options(sock); }
+
       if (!bind_or_connect(sock, hints)) {
         close_socket(sock);
         sock = INVALID_SOCKET;
@@ -2872,6 +2876,24 @@ inline void get_remote_ip_and_port(socket_t sock, std::string &ip, int &port) {
 
   if (!getpeername(sock, reinterpret_cast<struct sockaddr *>(&addr),
                    &addr_len)) {
+#ifndef _WIN32
+    if (addr.ss_family == AF_UNIX) {
+#if defined(__linux__)
+      struct ucred ucred;
+      socklen_t len = sizeof(ucred);
+      if (getsockopt(sock, SOL_SOCKET, SO_PEERCRED, &ucred, &len) == 0) {
+        port = ucred.pid;
+      }
+#elif defined(SOL_LOCAL) && defined(SO_PEERPID) // __APPLE__
+      pid_t pid;
+      socklen_t len = sizeof(pid);
+      if (getsockopt(sock, SOL_LOCAL, SO_PEERPID, &pid, &len) == 0) {
+        port = pid;
+      }
+#endif
+      return;
+    }
+#endif
     get_remote_ip_and_port(addr, addr_len, ip, port);
   }
 }
@@ -4725,7 +4747,7 @@ inline bool SocketStream::is_readable() const {
 
 inline bool SocketStream::is_writable() const {
   return select_write(sock_, write_timeout_sec_, write_timeout_usec_) > 0 &&
-    is_socket_alive(sock_);
+         is_socket_alive(sock_);
 }
 
 inline ssize_t SocketStream::read(char *ptr, size_t size) {
@@ -6732,6 +6754,11 @@ inline Result ClientImpl::Post(const std::string &path) {
   return Post(path, std::string(), std::string());
 }
 
+inline Result ClientImpl::Post(const std::string &path,
+                               const Headers &headers) {
+  return Post(path, headers, nullptr, 0, std::string());
+}
+
 inline Result ClientImpl::Post(const std::string &path, const char *body,
                                size_t content_length,
                                const std::string &content_type) {
@@ -7349,7 +7376,7 @@ inline bool SSLSocketStream::is_readable() const {
 
 inline bool SSLSocketStream::is_writable() const {
   return select_write(sock_, write_timeout_sec_, write_timeout_usec_) > 0 &&
-    is_socket_alive(sock_);
+         is_socket_alive(sock_);
 }
 
 inline ssize_t SSLSocketStream::read(char *ptr, size_t size) {
@@ -8055,6 +8082,9 @@ inline Result Client::Head(const std::string &path, const Headers &headers) {
 }
 
 inline Result Client::Post(const std::string &path) { return cli_->Post(path); }
+inline Result Client::Post(const std::string &path, const Headers &headers) {
+  return cli_->Post(path, headers);
+}
 inline Result Client::Post(const std::string &path, const char *body,
                            size_t content_length,
                            const std::string &content_type) {
@@ -8384,5 +8414,9 @@ inline SSL_CTX *Client::ssl_context() const {
 // ----------------------------------------------------------------------------
 
 } // namespace httplib
+
+#if defined(_WIN32) && defined(CPPHTTPLIB_USE_POLL)
+#undef poll
+#endif
 
 #endif // CPPHTTPLIB_HTTPLIB_H
